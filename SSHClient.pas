@@ -220,7 +220,7 @@ begin
     // Открываем удаленный файл для записи
     RemoteFile := libssh2_sftp_open_ex
       (SFTPHandle, PAnsiChar(AnsiString(RemoteFileName)), Length(RemoteFileName)
-        , LIBSSH2_FXF_WRITE or LIBSSH2_FXF_CREAT, 0, 0);
+        , LIBSSH2_FXF_WRITE or LIBSSH2_FXF_CREAT, $1A4, 0);
     if RemoteFile = nil then
       raise Exception.Create('Failed to open remote file for writing');
 
