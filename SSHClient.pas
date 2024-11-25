@@ -2,6 +2,8 @@ unit SSHClient;
 
 interface
 
+{$O-}
+
 uses
   SysUtils, Windows, Classes, WinSock;
 
@@ -29,6 +31,7 @@ const
   LIBSSH2_FXF_APPEND = $00000004;
   LIBSSH2_FXF_TRUNC = $00000010;
   LIBSSH2_FXF_EXCL = $00000020;
+  LIBSSH2_ERROR_EAGAIN = -37;
 
 type
   LIBSSH2_PASSWD_CHANGEREQ_FUNC = procedure
@@ -45,7 +48,8 @@ type
       FLibSSH2: THandle;
 
       procedure LoadLibSSH2;
-      procedure CheckError(ResultCode: Integer; const ErrorMessage: string);
+      procedure CheckLibSshResult(ResultCode: Integer; session: Pointer;
+        const Op: string);
       function CreateSocket: TSocket;
     public
       constructor Create(const Host, Username, Password: string;
@@ -91,8 +95,13 @@ type
   libssh2_sftp_read_func = function(handle: Pointer; buffer: PAnsiChar;
     buffer_maxlen: NativeInt): NativeInt; cdecl;
   libssh2_sftp_unlink_ex_func = function(sftp: Pointer;
-                                         const filename: PAnsiChar;
-                                         filename_len: UInt): Integer; cdecl;
+    const filename: PAnsiChar; filename_len: UInt): Integer; cdecl;
+  libssh2_userauth_list_func = function(session: Pointer;
+    const Username: PAnsiChar; username_len: Cardinal): PAnsiChar; cdecl;
+  libssh2_session_last_error_func = function
+    (session: Pointer; var errmsg: PAnsiChar; var errmsg_len: Integer;
+    want_buf: Integer): Integer; cdecl;
+
 var
   libssh2_init: libssh2_init_func;
   libssh2_exit: libssh2_exit_func;
@@ -110,6 +119,9 @@ var
   libssh2_sftp_close_handle: libssh2_sftp_close_handle_func;
   libssh2_sftp_read: libssh2_sftp_read_func;
   libssh2_sftp_unlink_ex: libssh2_sftp_unlink_ex_func;
+  libssh2_userauth_list: libssh2_userauth_list_func;
+  libssh2_session_last_error: libssh2_session_last_error_func;
+
 constructor TSSHClient.Create(const Host, Username, Password: string;
   const Port: Integer = 22);
 begin
@@ -162,15 +174,44 @@ begin
     'libssh2_sftp_close_handle');
   @libssh2_sftp_read := GetProcAddress(FLibSSH2, 'libssh2_sftp_read');
   @libssh2_sftp_unlink_ex := GetProcAddress(FLibSSH2, 'libssh2_sftp_unlink_ex');
+  @libssh2_userauth_list := GetProcAddress(FLibSSH2, 'libssh2_userauth_list');
+
+  @libssh2_session_last_error := GetProcAddress(FLibSSH2,
+    'libssh2_session_last_error');
+
   if not Assigned(libssh2_userauth_password_ex) then
     raise Exception.Create('libssh2_userauth_password_ex function not found');
 end;
 
-procedure TSSHClient.CheckError(ResultCode: Integer;
-  const ErrorMessage: string);
+procedure TSSHClient.CheckLibSshResult(ResultCode: Integer; session: Pointer;
+  const Op: string);
+var
+  errmsg: PAnsiChar;
+  ErrMsgLen: Integer;
+  ErrMsgStr: string;
 begin
   if ResultCode < 0 then
-    raise Exception.CreateFmt('%s. Error code: %d', [ErrorMessage, ResultCode]);
+    begin
+      if session <> nil then
+        begin
+
+          if ResultCode = LIBSSH2_ERROR_EAGAIN then
+            Exit;
+
+          libssh2_session_last_error(session, errmsg, ErrMsgLen, 0);
+
+          ErrMsgStr := string(errmsg);
+        end
+      else
+        begin
+          ErrMsgStr := 'No session available';
+        end;
+
+      // Генерируем исключение с ошибкой
+      raise Exception.CreateFmt(
+        'LibSSH2 Error during operation "%s": %s. Error code: %d',
+        [Op, ErrMsgStr, ResultCode]);
+    end;
 end;
 
 procedure TSSHClient.DeleteFileFromServer(const RemoteFileName: string);
@@ -328,7 +369,7 @@ begin
       end
     else
       begin
-        CheckError(ResultCode, 'Failed to create directory: ' + DirectoryPath);
+        CheckLibSshResult(ResultCode, SFTPSession, 'libssh2_sftp_mkdir_ex');
       end;
   finally
     // Завершение SFTP-сессии
@@ -367,12 +408,14 @@ var
   ResultCode: Integer;
   Username, Password: AnsiString;
   ChangePasswdCallback: LIBSSH2_PASSWD_CHANGEREQ_FUNC;
+  SupportedMethods: PAnsiChar;
 begin
+
   Result := False;
 
   // Initialize libssh2
   ResultCode := libssh2_init(0);
-  CheckError(ResultCode, 'libssh2 initialization failed');
+  CheckLibSshResult(ResultCode, nil, 'libssh2_init'); ;
 
   // Create the SSH session
   FSession := libssh2_session_init_ex(nil, nil, nil, nil);
@@ -385,15 +428,14 @@ begin
   // Set preferred host key algorithm
   ResultCode := libssh2_session_method_pref(FSession, LIBSSH2_METHOD_HOSTKEY,
     PAnsiChar(AnsiString('ssh-rsa,ssh-dss')));
-  CheckError(ResultCode, 'Failed to set preferred host key method');
+  CheckLibSshResult(ResultCode, FSession, 'libssh2_session_method_pref');
 
   // Perform the handshake
   ResultCode := libssh2_session_handshake(FSession, FSocket);
-  CheckError(ResultCode, 'SSH handshake failed');
+  CheckLibSshResult(ResultCode, FSession, 'libssh2_session_handshake');
 
-  // Ensure the session is valid before proceeding
-  if FSession = nil then
-    raise Exception.Create('Session is invalid before authentication');
+  // SupportedMethods := libssh2_userauth_list
+  // (FSession, PAnsiChar(AnsiString(FUsername)), Length(FUsername));
 
   // Ensure username and password are not empty
   Username := AnsiString(FUsername);
@@ -409,7 +451,7 @@ begin
   ResultCode := libssh2_userauth_password_ex
     (FSession, PAnsiChar(Username), Length(Username), PAnsiChar(Password),
     Length(Password), ChangePasswdCallback);
-  CheckError(ResultCode, 'Authentication failed');
+  CheckLibSshResult(ResultCode, FSession, 'libssh2_userauth_password_ex');
 
   Result := True;
 end;
